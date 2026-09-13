@@ -1,0 +1,24 @@
+# The Dockerfile only COPYs pyproject.toml, uv.lock and app/, so nothing below
+# could reach the image anyway. This is about the BUILD CONTEXT: everything in
+# this directory is tar'd and sent to the Docker daemon before the build starts,
+# whether the Dockerfile uses it or not. .venv alone is ~17 MB of pointless
+# transfer on every build.
+#
+# It is also a safety net. The day someone writes `COPY . .`, this file is what
+# stops a local virtualenv, the git history, and any stray .env from being
+# baked into a published image.
+#
+# Added 2026-09-09 (D-14). gateway/.dockerignore is the same file.
+
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.gitattributes
+.dockerignore
+Dockerfile
+tests/
+README.md
+.env
+*.log
