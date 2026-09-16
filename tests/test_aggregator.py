@@ -7,6 +7,7 @@ an ERROR.
 """
 
 import contextlib
+from datetime import datetime, timezone
 
 import httpx2
 import pytest
@@ -219,6 +220,37 @@ def test_age_seconds_is_reported():
     with client() as c:
         body = c.get("/status").json()
     assert body["age_seconds"] >= 0
+
+
+def test_checked_at_is_a_real_timestamp_not_a_monotonic_reading():
+    """Regression guard, 2026-09-16.
+
+    `checked_at` used to be `time.monotonic()` published straight out of the
+    cache, so responses carried things like `"checked_at": 120573.88`.
+    Monotonic counts from an arbitrary epoch -- boot, in practice -- which
+    makes that number meaningless to anyone outside the process: a client
+    renders it as 1970, two replicas disagree about the same instant, and it
+    runs BACKWARDS after a restart.
+
+    Monotonic is still correct for the cache TTL, and still used for it. The
+    bug was publishing it.
+
+    Parsing it is the assertion. A float would raise TypeError and a
+    monotonic-looking string would fail `fromisoformat`, so this cannot pass
+    for the old behaviour. The sanity bound then catches the subtler mistake
+    of a correctly-formatted timestamp built from the wrong clock.
+    """
+    before = datetime.now(timezone.utc)
+    with client() as c:
+        body = c.get("/status").json()
+    after = datetime.now(timezone.utc)
+
+    parsed = datetime.fromisoformat(body["checked_at"])
+    assert parsed.tzinfo is not None, "timestamp must be timezone-aware, not naive"
+    assert before <= parsed <= after, (
+        f"checked_at {parsed} is outside the window this request ran in "
+        f"({before} .. {after}) -- wrong clock"
+    )
 
 
 # ------------------------------------------------------------------ config --

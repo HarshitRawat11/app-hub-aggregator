@@ -23,6 +23,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx2
 from fastapi import FastAPI, HTTPException
@@ -56,7 +57,25 @@ class LinkStatus(BaseModel):
 
 
 class StatusReport(BaseModel):
-    checked_at: float
+    # An ISO-8601 UTC timestamp, and it is a STRING rather than the float it
+    # was until 2026-09-16.
+    #
+    # It used to carry `time.monotonic()` straight out of the cache entry,
+    # which produced responses like `"checked_at": 120573.88`. Monotonic time
+    # counts from an arbitrary epoch -- in practice boot -- so that number is
+    # meaningless outside the process that produced it. Three ways it was
+    # actively wrong, not merely ugly:
+    #
+    #   - A field named `checked_at` reads as a timestamp, so any client
+    #     renders it and gets a date in 1970.
+    #   - It is not comparable ACROSS PODS. Two replicas answering the same
+    #     question return wildly different values for the same instant.
+    #   - It goes BACKWARDS on restart, because the epoch resets.
+    #
+    # Monotonic is still exactly right for the cache TTL below -- that is what
+    # it is for, since it cannot jump when the system clock is adjusted. The
+    # bug was never using it; it was publishing it.
+    checked_at: str
     age_seconds: float
     cached: bool
     summary: dict[str, int]
@@ -127,7 +146,7 @@ async def status(refresh: bool = False):
     now = time.monotonic()
 
     cached = app.state.cache
-    if not refresh and cached and (now - cached["checked_at"]) < CACHE_TTL:
+    if not refresh and cached and (now - cached["monotonic"]) < CACHE_TTL:
         return _report(cached, now, from_cache=True)
 
     # One probe run at a time. Without this, ten simultaneous requests on a
@@ -136,14 +155,25 @@ async def status(refresh: bool = False):
     # several people opened at once.
     async with app.state.cache_lock:
         cached = app.state.cache
-        if not refresh and cached and (time.monotonic() - cached["checked_at"]) < CACHE_TTL:
+        if not refresh and cached and (time.monotonic() - cached["monotonic"]) < CACHE_TTL:
             # Someone else refreshed it while we waited for the lock.
             return _report(cached, time.monotonic(), from_cache=True)
 
         links = await fetch_links()
         results = await probe_many(app.state.prober, [link["url"] for link in links])
         app.state.cache = {
-            "checked_at": time.monotonic(),
+            # TWO clocks, deliberately, because they answer different
+            # questions and neither can do the other's job.
+            #
+            # `monotonic` drives the TTL comparison above. It never jumps when
+            # NTP corrects the system clock, so a cache entry cannot suddenly
+            # look an hour old (or an hour in the future) because of a clock
+            # adjustment.
+            #
+            # `wall` is the one that goes in the response. It is the only one
+            # a caller can interpret, compare between pods, or print.
+            "monotonic": time.monotonic(),
+            "wall": datetime.now(timezone.utc),
             "links": [
                 LinkStatus(**link, probe=probe) for link, probe in zip(links, results)
             ],
@@ -157,8 +187,12 @@ def _report(entry: dict, now: float, from_cache: bool) -> StatusReport:
     for item in entry["links"]:
         summary[item.probe.status] = summary.get(item.probe.status, 0) + 1
     return StatusReport(
-        checked_at=entry["checked_at"],
-        age_seconds=round(now - entry["checked_at"], 1),
+        # Wall clock out, monotonic for the arithmetic. `age_seconds` stays
+        # derived from monotonic on purpose: subtracting two wall-clock
+        # readings would report a negative age if NTP stepped the clock back
+        # between the probe run and this response.
+        checked_at=entry["wall"].isoformat(),
+        age_seconds=round(now - entry["monotonic"], 1),
         cached=from_cache,
         summary=summary,
         links=entry["links"],
